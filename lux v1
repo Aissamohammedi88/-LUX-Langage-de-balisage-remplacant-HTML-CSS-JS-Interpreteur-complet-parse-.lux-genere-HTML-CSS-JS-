@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# LUX — Langage de balisage remplacant HTML + CSS + JS
+# Interpreteur complet : parse .lux, genere HTML+CSS+JS, sert sur localhost.
+# Auteur : Aissa Mohammedi (DGK)
+# Licence : NEXUS-OPEN-2.0
+
+import os
+import re
+import sys
+import json
+import time
+import html as html_lib
+import socket
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+
+VERSION = "1.0.0"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "NEXUS-OPEN-2.0"
+
+HOME = os.path.expanduser("~")
+OUT = os.path.join(HOME, "Documents", "lux")
+os.makedirs(OUT, exist_ok=True)
+
+PORT = 8093
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 8 THEMES INTEGRES
+# ═══════════════════════════════════════════════════════════════════
+
+THEMES = {
+"sombre": {
+"bg": "#0a0a12", "fg": "#e0e0e0", "accent": "#00ffc8",
+"accent2": "#ff0080", "muted": "#5a5a6a", "panel": "#14141e",
+},
+"clair": {
+"bg": "#f5f7fa", "fg": "#1a1a2a", "accent": "#0066cc",
+"accent2": "#cc0066", "muted": "#8892a6", "panel": "#ffffff",
+},
+"cyber": {
+"bg": "#05000a", "fg": "#c8ffd0", "accent": "#00ffc8",
+"accent2": "#ff00c8", "muted": "#5a8a7a", "panel": "#0a1a12",
+},
+"matrix": {
+"bg": "#000000", "fg": "#00ff00", "accent": "#00ff00",
+"accent2": "#00aa00", "muted": "#004400", "panel": "#001100",
+},
+"sunset": {
+"bg": "#0a0500", "fg": "#ffcc88", "accent": "#ff8800",
+"accent2": "#ff0088", "muted": "#8a5a3a", "panel": "#1a0f05",
+},
+"ocean": {
+"bg": "#000a14", "fg": "#c8e8ff", "accent": "#00c8ff",
+"accent2": "#0088ff", "muted": "#5a7a8a", "panel": "#0a1a2a",
+},
+"foret": {
+"bg": "#050a05", "fg": "#d8f0d8", "accent": "#00cc44",
+"accent2": "#88aa00", "muted": "#5a7a5a", "panel": "#0a150a",
+},
+"minimal": {
+"bg": "#ffffff", "fg": "#000000", "accent": "#000000",
+"accent2": "#666666", "muted": "#999999", "panel": "#f0f0f0",
+},
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PARSEUR LUX
+# ═══════════════════════════════════════════════════════════════════
+
+def parse_attributs(texte):
+"""Extrait les attributs key=value d'une ligne LUX."""
+attrs = {}
+# Pattern : key="value with spaces" ou key=value_sans_espace
+pattern = re.compile(r'([a-zA-Z_][a-zA-Z0-9_\-]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s]+))')
+for m in pattern.finditer(texte):
+key = m.group(1)
+val = m.group(2) if m.group(2) is not None else (m.group(3) if m.group(3) is not None else m.group(4))
+attrs[key] = val
+return attrs
+
+
+def parse_lux(contenu):
+"""
+Parse un fichier LUX ligne par ligne.
+Retourne une liste d'elements {niveau, primitif, valeur, attributs, enfants}.
+"""
+lignes = []
+for ligne in contenu.split("\n"):
+# Garder l'indentation pour calculer le niveau
+brut = ligne.rstrip()
+if not brut.strip():
+continue
+
+# Sauter les commentaires
+strip = brut.strip()
+if strip.startswith("#") or strip.startswith("//"):
+continue
+
+# Calculer le niveau (indentation)
+indent = len(brut) - len(brut.lstrip())
+niveau = indent // 2
+
+# Extraire la premiere "primitive" et sa valeur
+m = re.match(r'([a-zA-Z_][a-zA-Z0-9_\-]*)\s*(.*)', strip)
+if not m:
+continue
+
+primitif = m.group(1)
+reste = m.group(2)
+
+# Extraire la valeur (ce qui est entre "..." au debut du reste)
+valeur = ""
+m_val = re.match(r'\s*"([^"]*)"', reste)
+if m_val:
+valeur = m_val.group(1)
+reste = reste[m_val.end():]
+
+# Extraire les attributs du reste
+attrs = parse_attributs(reste)
+
+lignes.append({
+"niveau": niveau,
+"primitif": primitif,
+"valeur": valeur,
+"attributs": attrs,
+})
+
+# Construire l'arbre
+racine = {"niveau": -1, "primitif": "_root", "valeur": "", "attributs": {}, "enfants": []}
+pile = [racine]
+
+for el in lignes:
+el["enfants"] = []
+while pile and pile[-1]["niveau"] >= el["niveau"]:
+pile.pop()
+if pile:
+pile[-1]["enfants"].append(el)
+pile.append(el)
+
+return racine["enfants"]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GENERATEURS CSS / HTML / JS
+# ═══════════════════════════════════════════════════════════════════
+
+def couleur(theme, key, defaut=None):
+if key in theme:
+return theme[key]
+return defaut or theme["fg"]
+
+
+def style_inline(attrs, theme, defaut=None):
+"""Convertit les attributs LUX en styles CSS inline."""
+styles = []
+mapping = {
+"couleur": "color",
+"taille": "font-size",
+"poids": "font-weight",
+"fond": "background",
+"bord": "border",
+"bord_couleur": "border-color",
+"marge": "margin",
+"pad": "padding",
+"largeur": "width",
+"hauteur": "height",
+"centre": "text-align",
+"radius": "border-radius",
+"opacite": "opacity",
+"espace": "letter-spacing",
+"ligne": "line-height",
+"flex": "display",
+"gap": "gap",
+"align": "align-items",
+"justify": "justify-content",
+}
+for k, v in attrs.items():
+if k in mapping:
+css_key = mapping[k]
+if css_key == "font-size" and v.isdigit():
+v = v + "px"
+if css_key == "text-align" and v == "oui":
+v = "center"
+if css_key == "display" and v == "oui":
+v = "flex"
+styles.append(css_key + ": " + v)
+return "; ".join(styles)
+
+
+def gen_html_recursive(elements, theme, ctx):
+"""Genere le HTML recursivement."""
+html_parts = []
+
+for el in elements:
+primitif = el["primitif"]
+valeur = el["valeur"]
+attrs = el["attributs"]
+enfants = el["enfants"]
+style = style_inline(attrs, theme)
+
+# ── page ──
+if primitif == "page":
+titre = attrs.get("titre", "LUX Page")
+ctx["titre"] = titre
+if "theme" in attrs and attrs["theme"] in THEMES:
+ctx["theme_actif"] = attrs["theme"]
+html_parts.extend(gen_html_recursive(enfants, theme, ctx))
+
+# ── section ──
+elif primitif == "section":
+s = "display: flex; flex-direction: column; gap: 12px; padding: 20px;"
+if style:
+s += " " + style
+html_parts.append('<section style="' + s + '">')
+html_parts.extend(gen_html_recursive(enfants, theme, ctx))
+html_parts.append('</section>')
+
+# ── ligne ── (horizontal)
+elif primitif == "ligne":
+s = "display: flex; flex-direction: row; gap: 12px; align-items: center;"
+if style:
+s += " " + style
+html_parts.append('<div style="' + s + '">')
+html_parts.extend(gen_html_recursive(enfants, theme, ctx))
+html_parts.append('</div>')
+
+# ── colonne ──
+elif primitif == "colonne":
+s = "display: flex; flex-direction: column; gap: 8px;"
+if style:
+s += " " + style
+html_parts.append('<div style="' + s + '">')
+html_parts.extend(gen_html_recursive(enfants, theme, ctx))
+html_parts.append('</div>')
+
+# ── titre ──
+elif primitif == "titre":
+taille = attrs.get("taille", "32")
+if taille.isdigit():
+taille = taille + "px"
+couleur_t = attrs.get("couleur", theme["accent"])
+s = "color: " + couleur_t + "; font-size: " + taille + "; font-weight: 700; margin: 8px 0; letter-spacing: -0.5px;"
+if style:
+s += " " + style
+html_parts.append('<h1 style="' + s + '">' + html_lib.escape(valeur) + '</h1>')
+
+# ── texte ──
+elif primitif == "texte":
+couleur_t = attrs.get("couleur", theme["fg"])
+s = "color: " + couleur_t + "; font-size: 15px; line-height: 1.6; margin: 4px 0;"
+if style:
+s += " " + style
+html_parts.append('<p style="' + s + '">' + html_lib.escape(valeur) + '</p>')
+
+# ── code ──
+elif primitif == "code":
+s = "background: " + theme["panel"] + "; color: " + theme["accent"] + "; padding: 14px 16px; border-radius: 10px; font-family: ui-monospace, monospace; font-size: 13px; overflow-x: auto; border: 1px solid " + theme["muted"] + "44;"
+if style:
+s += " " + style
+html_parts.append('<pre style="' + s + '"><code>' + html_lib.escape(valeur) + '</code></pre>')
+
+# ── bouton ──
+elif primitif == "bouton":
+couleur_b = attrs.get("couleur", theme["accent"])
+action = attrs.get("action", "")
+s = "background: " + couleur_b + "; color: " + theme["bg"] + "; border: none; padding: 12px 24px; border-radius: 10px; font-weight: 700; font-size: 14px; cursor: pointer; transition: all 0.2s;"
+if style:
+s += " " + style
+onclick = ""
+if action:
+# L'action peut etre du JS ou un nom de fonction LUX
+if action.startswith(("alert", "console", "window", "document", "fetch", "location")):
+onclick = ' onclick="' + html_lib.escape(action) + '"'
+else:
+onclick = ' onclick="' + html_lib.escape(action) + '"'
+html_parts.append('<button style="' + s + '"' + onclick + '>' + html_lib.escape(valeur) + '</button>')
+
+# ── champ ──
+elif primitif == "champ":
+placeholder = attrs.get("placeholder", valeur)
+s = "background: " + theme["panel"] + "; color: " + theme["fg"] + "; border: 1px solid " + theme["muted"] + "; padding: 12px 16px; border-radius: 10px; font-size: 14px; font-family: inherit; outline: none; width: 100%;"
+if style:
+s += " " + style
+html_parts.append('<input type="text" style="' + s + '" placeholder="' + html_lib.escape(placeholder) + '">')
+
+# ── choix ──
+elif primitif == "choix":
+options = valeur.split(",") if valeur else []
+s = "background: " + theme["panel"] + "; color: " + theme["fg"] + "; border: 1px solid " + theme["muted"] + "; padding: 12px 16px; border-radius: 10px; font-size: 14px; font-family: inherit;"
+html_parts.append('<select style="' + s + '">')
+for opt in options:
+html_parts.append('<option>' + html_lib.escape(opt.strip()) + '</option>')
+html_parts.append('</select>')
+
+# ── case ──
+elif primitif == "case":
+s = "color: " + theme["fg"] + "; font-size: 14px; display: flex; gap: 8px; align-items: center;"
+html_parts.append('<label style="' + s + '"><input type="checkbox"> ' + html_lib.escape(valeur) + '</label>')
+
+# ── image ──
+elif primitif == "image":
+src = attrs.get("src", valeur)
+alt = attrs.get("alt", "")
+s = "border-radius: 10px; max-width: 100%;"
+if style:
+s += " " + style
+html_parts.append('<img src="' + html_lib.escape(src) + '" alt="' + html_lib.escape(alt) + '" style="' + s + '">')
+
+# ── zone ──
+elif primitif == "zone":
+largeur = attrs.get("largeur", "400")
+hauteur = attrs.get("hauteur", "400")
+typ = attrs.get("type", "canvas")
+ident = attrs.get("id", "zone_" + str(int(time.time() * 1000) % 100000))
+s = "background: " + theme["panel"] + "; border-radius: 10px; border: 1px solid " + theme["muted"] + "44;"
+if style:
+s += " " + style
+html_parts.append('<canvas id="' + ident + '" width="' + largeur + '" height="' + hauteur + '" style="' + s + '"></canvas>')
+
+# ── barre ──
+elif primitif == "barre":
+valeur_pct = attrs.get("valeur", valeur or "0")
+couleur_b = attrs.get("couleur", theme["accent"])
+s = "background: " + theme["panel"] + "; height: 8px; border-radius: 4px; overflow: hidden;"
+html_parts.append('<div style="' + s + '"><div style="background: ' + couleur_b + '; height: 100%; width: ' + str(valeur_pct) + '%;"></div></div>')
+
+# ── table ──
+elif primitif == "table":
+s = "width: 100%; border-collapse: collapse; margin: 8px 0;"
+html_parts.append('<table style="' + s + '">')
+html_parts.extend(gen_html_recursive(enfants, theme, ctx))
+html_parts.append('</table>')
+
+elif primitif == "ligne_table":
+html_parts.append('<tr style="border-bottom: 1px solid ' + theme["muted"] + '44;">')
+html_parts.extend(gen_html_recursive(enfants, theme, ctx))
+html_parts.append('</tr>')
+
+elif primitif == "cellule":
+s = "padding: 8px 10px; color: " + theme["fg"] + "; font-size: 13px;"
+html_parts.append('<td style="' + s + '">' + html_lib.escape(valeur) + '</td>')
+
+# ── liste ──
+elif primitif == "liste":
+items = [v.strip() for v in valeur.split(",")] if valeur else []
+s = "color: " + theme["fg"] + "; padding-left: 20px;"
+html_parts.append('<ul style="' + s + '">')
+for it in items:
+html_parts.append('<li>' + html_lib.escape(it) + '</li>')
+html_parts.append('</ul>')
+
+# ── temps ── (mise a jour auto)
+elif primitif == "temps":
+source = attrs.get("source", "")
+intervalle = attrs.get("intervalle", "1000")
+ident = "temps_" + str(int(time.time() * 1000) % 100000)
+s = "color: " + theme["accent"] + "; font-family: ui-monospace, monospace; font-size: 14px;"
+if style:
+s += " " + style
+html_parts.append('<div id="' + ident + '" style="' + s + '">--</div>')
+if source:
+ctx["scripts"].append(
+"setInterval(function(){"
+"fetch('" + source + "').then(r=>r.json()).then(d=>{"
+"var el=document.getElementById('" + ident + "');"
+"if(el)el.textContent=JSON.stringify(d).slice(0,200);"
+"}).catch(e=>{});"
+"}," + intervalle + ");"
+)
+
+# ── horloge ──
+elif primitif == "horloge":
+ident = "horloge_" + str(int(time.time() * 1000) % 100000)
+s = "color: " + theme["accent"] + "; font-family: ui-monospace, monospace; font-size: 20px;"
+if style:
+s += " " + style
+html_parts.append('<div id="' + ident + '" style="' + s + '">--:--:--</div>')
+ctx["scripts"].append(
+"setInterval(function(){"
+"var el=document.getElementById('" + ident + "');"
+"if(el)el.textContent=new Date().toLocaleTimeString();"
+"},1000);"
+)
+
+# ── compteur ──
+elif primitif == "compteur":
+depart = attrs.get("depart", "0")
+pas = attrs.get("pas", "1")
+intervalle = attrs.get("intervalle", "1000")
+ident = "compteur_" + str(int(time.time() * 1000) % 100000)
+s = "color: " + theme["accent"] + "; font-size: 32px; font-weight: 700; font-family: ui-monospace, monospace;"
+if style:
+s += " " + style
+html_parts.append('<div id="' + ident + '" style="' + s + '">' + depart + '</div>')
+ctx["scripts"].append(
+"var v_" + ident + "=" + depart + ";"
+"setInterval(function(){"
+"v_" + ident + "+=" + pas + ";"
+"var el=document.getElementById('" + ident + "');"
+"if(el)el.textContent=v_" + ident + ";"
+"}," + intervalle + ");"
+)
+
+# ── graphique ── (canvas anime)
+elif primitif == "graphique":
+largeur = attrs.get("largeur", "400")
+hauteur = attrs.get("hauteur", "200")
+ident = "graph_" + str(int(time.time() * 1000) % 100000)
+s = "background: " + theme["panel"] + "; border-radius: 10px; border: 1px solid " + theme["muted"] + "44;"
+if style:
+s += " " + style
+html_parts.append('<canvas id="' + ident + '" width="' + largeur + '" height="' + hauteur + '" style="' + s + '"></canvas>')
+ctx["scripts"].append(
+"(function(){"
+"var c=document.getElementById('" + ident + "');"
+"var ctx=c.getContext('2d');"
+"var data=Array.from({length:40},()=>Math.random()*100);"
+"setInterval(function(){"
+"data.push(Math.random()*100);"
+"data.shift();"
+"ctx.clearRect(0,0,c.width,c.height);"
+"ctx.strokeStyle='" + theme["accent"] + "';"
+"ctx.lineWidth=2;"
+"ctx.beginPath();"
+"data.forEach((v,i)=>{"
+"var x=i*(c.width/data.length);"
+"var y=c.height-(v/100)*c.height;"
+"if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);"
+"});"
+"ctx.stroke();"
+"},500);"
+"})();"
+)
+
+# ── inconnu : ignorer ──
+
+return html_parts
+
+
+def compiler_lux(contenu):
+"""Compile un fichier LUX en HTML complet."""
+elements = parse_lux(contenu)
+
+# Theme par defaut
+theme_nom = "sombre"
+ctx = {
+"titre": "LUX Page",
+"theme_actif": theme_nom,
+"scripts": [],
+}
+
+# Chercher le theme dans le premier element page
+for el in elements:
+if el["primitif"] == "page" and "theme" in el["attributs"]:
+if el["attributs"]["theme"] in THEMES:
+ctx["theme_actif"] = el["attributs"]["theme"]
+break
+
+theme = THEMES.get(ctx["theme_actif"], THEMES["sombre"])
+
+# Generer le corps
+corps = gen_html_recursive(elements, theme, ctx)
+
+# HTML final
+return """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>""" + html_lib.escape(ctx["titre"]) + """</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+background: """ + theme["bg"] + """;
+color: """ + theme["fg"] + """;
+font-family: -apple-system, system-ui, sans-serif;
+min-height: 100vh;
+padding: 20px;
+line-height: 1.5;
+}
+.lux-container { max-width: 900px; margin: 0 auto; }
+button:hover { transform: translateY(-2px); opacity: 0.9; }
+input:focus, select:focus { border-color: """ + theme["accent"] + """ !important; }
+</style>
+</head>
+<body>
+<div class="lux-container">
+""" + "\n".join(corps) + """
+</div>
+<script>
+""" + "\n".join(ctx["scripts"]) + """
+</script>
+</body>
+</html>"""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PAGE LUX DE DEMO
+# ═══════════════════════════════════════════════════════════════════
+
+DEMO_LUX = '''page titre="NEXUS LUX Demo" theme="cyber"
+
+section
+titre "NEXUS LUX" taille=48 couleur=#00ffc8
+texte "Le langage qui remplace HTML + CSS + JS." couleur=#5a8a7a
+texte "Un seul fichier. Un seul langage. Zero dependance."
+
+section
+titre "Compteur temps reel" taille=22
+compteur depart=0 pas=1 intervalle=1000
+
+section
+titre "Horloge UTC" taille=22
+horloge
+
+section
+titre "Graphique anime" taille=22
+graphique largeur=600 hauteur=200
+
+section
+titre "Barre de progression" taille=22
+barre valeur=73 couleur=#ff00c8
+
+section
+titre "Tableau de donnees" taille=22
+table
+ligne_table
+cellule "Nom"
+cellule "Role"
+cellule "Statut"
+ligne_table
+cellule "Aissa Mohammedi"
+cellule "Createur"
+cellule "Actif"
+ligne_table
+cellule "NEXUS"
+cellule "Protocole"
+cellule "En ligne"
+
+section
+titre "Formulaire" taille=22
+champ placeholder="Ton nom..."
+choix "Option 1, Option 2, Option 3"
+case "Accepter les conditions"
+bouton "Envoyer" couleur=#ff00c8 action="alert('Envoye !')"
+
+section
+titre "Code source" taille=22
+code "def hello():\\n print('NEXUS')"
+
+section
+titre "Liste" taille=22
+liste "Python, JavaScript, Rust, Go, Swift"
+'''
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SERVEUR
+# ═══════════════════════════════════════════════════════════════════
+
+ETAT = {"lux": DEMO_LUX, "html": "", "lock": threading.RLock()}
+
+
+def recharger():
+with ETAT["lock"]:
+ETAT["html"] = compiler_lux(ETAT["lux"])
+
+
+class Handler(BaseHTTPRequestHandler):
+def log_message(self, *a):
+pass
+
+def _send(self, code, content, ctype="text/html"):
+try:
+self.send_response(code)
+self.send_header("Content-Type", ctype + "; charset=utf-8")
+self.send_header("Access-Control-Allow-Origin", "*")
+self.send_header("Cache-Control", "no-cache")
+self.send_header("Content-Length", str(len(content)))
+self.end_headers()
+self.wfile.write(content)
+except (BrokenPipeError, ConnectionResetError):
+pass
+
+def do_GET(self):
+p = self.path.split("?")[0]
+
+if p in ("/", "/index.html"):
+with ETAT["lock"]:
+contenu = ETAT["html"] or compiler_lux(ETAT["lux"])
+return self._send(200, contenu.encode("utf-8"), "text/html")
+
+if p == "/lux":
+with ETAT["lock"]:
+contenu = ETAT["lux"]
+return self._send(200, contenu.encode("utf-8"), "text/plain")
+
+if p == "/api/sante":
+with ETAT["lock"]:
+return self._send(200, json.dumps({
+"ok": True, "version": VERSION,
+"themes": list(THEMES.keys()),
+"taille_lux": len(ETAT["lux"]),
+}).encode())
+
+return self._send(404, b"not found", "text/plain")
+
+def do_POST(self):
+if self.path == "/api/compiler":
+try:
+length = int(self.headers.get("Content-Length", 0))
+body = self.rfile.read(length).decode("utf-8")
+data = json.loads(body)
+lux = data.get("lux", "")
+if lux:
+with ETAT["lock"]:
+ETAT["lux"] = lux
+ETAT["html"] = compiler_lux(lux)
+return self._send(200, json.dumps({"ok": True}).encode())
+except Exception as e:
+return self._send(500, json.dumps({"erreur": str(e)}).encode())
+return self._send(404, b"not found")
+
+
+class Server(ThreadingMixIn, HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+def ip_locale():
+try:
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("8.8.8.8", 80))
+ip = s.getsockname()[0]
+s.close()
+return ip
+except Exception:
+return "localhost"
+
+
+def main():
+print("")
+print("=" * 70)
+print(" LUX — Langage de balisage remplacant HTML + CSS + JS")
+print(" Auteur : " + AUTEUR)
+print(" Version : " + VERSION)
+print(" Licence : " + LICENCE)
+print("=" * 70)
+print("")
+
+# Sauvegarder la demo
+demo_file = os.path.join(OUT, "demo.lux")
+try:
+with open(demo_file, "w", encoding="utf-8") as f:
+f.write(DEMO_LUX)
+print(" Demo LUX : " + demo_file)
+except OSError:
+pass
+
+# Compiler une premiere fois
+recharger()
+with ETAT["lock"]:
+taille_html = len(ETAT["html"])
+print(" Compilation : OK (" + str(taille_html) + " octets HTML)")
+print("")
+
+# Sauvegarder l'HTML compile
+html_file = os.path.join(OUT, "demo.html")
+try:
+with ETAT["lock"]:
+with open(html_file, "w", encoding="utf-8") as f:
+f.write(ETAT["html"])
+print(" HTML compile : " + html_file)
+except OSError:
+pass
+
+# Themes disponibles
+print(" Themes : " + ", ".join(THEMES.keys()))
+print("")
+
+ip = ip_locale()
+print(" Local : http://localhost:" + str(PORT) + "/")
+print(" Reseau : http://" + ip + ":" + str(PORT) + "/")
+print(" Source : http://localhost:" + str(PORT) + "/lux")
+print("")
+print(" Ctrl+C pour arreter.")
+print("")
+
+try:
+with Server(("0.0.0.0", PORT), Handler) as httpd:
+httpd.serve_forever()
+except KeyboardInterrupt:
+print("\nArrete.")
+except OSError as e:
+print("Port " + str(PORT) + " occupe : " + str(e))
+
+
+if __name__ == "__main__":
+main()
